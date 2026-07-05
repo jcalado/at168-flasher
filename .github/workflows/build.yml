@@ -1,0 +1,63 @@
+name: Build & Release
+
+# Build native executables for Windows, Linux and macOS.
+# - Every push / PR: build all three and upload them as CI artifacts.
+# - Push a tag like v1.0.0: also attach the binaries to a GitHub Release.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the Release on tag pushes
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: AT168-Flasher-linux-x86_64
+            bin: dist/AT168-Flasher
+          - os: windows-latest
+            asset: AT168-Flasher-windows-x86_64.exe
+            bin: dist/AT168-Flasher.exe
+          - os: macos-latest
+            asset: AT168-Flasher-macos-arm64
+            bin: dist/AT168-Flasher
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build executable
+        run: pyinstaller at168-flasher.spec
+
+      - name: Rename binary
+        shell: bash
+        run: mv "${{ matrix.bin }}" "${{ matrix.asset }}"
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}

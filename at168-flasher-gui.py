@@ -27,6 +27,9 @@ import dearpygui.dearpygui as dpg
 import serial
 import serial.tools.list_ports
 
+# ----------------------------------------------------------------------------
+# Flashing protocol (UPDATE / WRITE)
+# ----------------------------------------------------------------------------
 BASE_ADDRESS = 0x08004000
 BAUDRATE = 4000000
 CHUNK = 32
@@ -38,12 +41,32 @@ FW_MIN_SIZE = 16 * 1024          # 16 KiB
 FW_MAX_SIZE = 4 * 1024 * 1024    # 4 MiB
 
 # ----------------------------------------------------------------------------
-# Shared state between the UI and the worker thread.
+# Calibration backup protocol (PROGRAM / READ)
+# ----------------------------------------------------------------------------
+CALIB_BAUD = 921600
+CALIB_TIMEOUT = 3.0
+READ_CHUNK = 128
+EXPECTED_DEVICE_ID = b"ID168UV\x00V100\x00\x00\x06"
+READ_REGIONS = [
+    (0x02F60000, 2048, 'calibration'),
+    (0x02FA0000,  512, 'device-info'),
+]
+
+
+class _Cancelled(Exception):
+    """Raised inside the backup worker when the user cancels."""
+
+
+# ----------------------------------------------------------------------------
+# Shared state between the UI and the worker threads.
 # ----------------------------------------------------------------------------
 state = {
     'firmware_path': None,
     'firmware': None,
-    'flashing': False,
+    'busy': False,        # any long operation is running (locks shared controls)
+    'flashing': False,    # flash loop active   (also the cancel flag)
+    'backuping': False,   # backup loop active  (also the cancel flag)
+    'calib_dir': os.getcwd(),
     'worker': None,
 }
 
@@ -103,14 +126,36 @@ def refresh_ports(sender=None, app_data=None, quiet=False):
         dpg.set_value('port_combo', '')
         dpg.set_value('port_desc_label', '')
         log('No serial ports found.', 'warn')
-    update_flash_button()
+    update_controls()
 
 
 def update_port_desc(sender=None, app_data=None):
     dev = dpg.get_value('port_combo')
     desc = port_info.get(dev, '')
     dpg.set_value('port_desc_label', desc)
-    update_flash_button()
+    update_controls()
+
+
+# ----------------------------------------------------------------------------
+# Control enable/disable (shared lock)
+# ----------------------------------------------------------------------------
+def update_controls():
+    """Reflect the current busy/readiness state onto every interactive item."""
+    busy = state['busy']
+    port_ok = bool(dpg.get_value('port_combo'))
+
+    # Shared controls
+    dpg.configure_item('refresh_button', enabled=not busy)
+    dpg.configure_item('port_combo', enabled=not busy)
+
+    # Flash tab
+    dpg.configure_item('browse_button', enabled=not busy)
+    dpg.configure_item('flash_button', enabled=(
+        not busy and state['firmware'] is not None and port_ok))
+
+    # Backup tab
+    dpg.configure_item('calib_folder_button', enabled=not busy)
+    dpg.configure_item('calib_button', enabled=(not busy and port_ok))
 
 
 # ----------------------------------------------------------------------------
@@ -133,9 +178,16 @@ def check_firmware(data):
 
 
 def on_firmware_selected(sender, app_data):
-    # app_data['file_path_name'] holds the chosen file.
+    # app_data['file_path_name'] usually holds the chosen file, but depending
+    # on how the dialog is dismissed (double-click vs. OK) it can come back as
+    # just the directory. Fall back to the 'selections' map, which holds the
+    # actual highlighted file(s) as {name: full_path}.
     path = app_data.get('file_path_name')
     if not path or not os.path.isfile(path):
+        selections = app_data.get('selections') or {}
+        path = next(iter(selections.values()), None)
+    if not path or not os.path.isfile(path):
+        log('Could not determine the selected firmware file.', 'warn')
         return
     try:
         with open(path, 'rb') as f:
@@ -153,7 +205,7 @@ def on_firmware_selected(sender, app_data):
         state['firmware_path'] = None
         state['firmware'] = None
         dpg.set_value('firmware_label', '(invalid file)')
-        update_flash_button()
+        update_controls()
         return
 
     state['firmware_path'] = path
@@ -161,16 +213,7 @@ def on_firmware_selected(sender, app_data):
     dpg.set_value('firmware_label', f'{os.path.basename(path)}  ({len(data)} bytes)')
     if not warnings:
         log(f'Loaded firmware "{os.path.basename(path)}" ({len(data)} bytes).', 'ok')
-    update_flash_button()
-
-
-def update_flash_button():
-    ready = (
-        not state['flashing']
-        and state['firmware'] is not None
-        and bool(dpg.get_value('port_combo'))
-    )
-    dpg.configure_item('flash_button', enabled=ready)
+    update_controls()
 
 
 # ----------------------------------------------------------------------------
@@ -251,13 +294,158 @@ def flash_worker(port, firmware):
 
     finally:
         state['flashing'] = False
+        state['busy'] = False
         dpg.configure_item('flash_button', label='Flash Firmware')
         dpg.configure_item('cancel_button', enabled=False)
-        # Re-enable the controls that were locked during flashing.
-        dpg.configure_item('refresh_button', enabled=True)
-        dpg.configure_item('browse_button', enabled=True)
-        dpg.configure_item('port_combo', enabled=True)
-        update_flash_button()
+        update_controls()
+
+
+# ----------------------------------------------------------------------------
+# Calibration backup worker  (ported from at-calib.py)
+# ----------------------------------------------------------------------------
+def _calib_send(s, data):
+    s.write(data)
+    s.flush()
+
+
+def _calib_recv(s, n):
+    buf = b''
+    deadline = time.monotonic() + CALIB_TIMEOUT
+    while len(buf) < n:
+        if not state['backuping']:
+            raise _Cancelled()
+        if time.monotonic() > deadline:
+            raise TimeoutError(f'Timeout waiting for {n} bytes; got {len(buf)}')
+        chunk = s.read(n - len(buf))
+        if chunk:
+            buf += chunk
+            deadline = time.monotonic() + CALIB_TIMEOUT
+    return buf
+
+
+def _calib_checksum(data):
+    return sum(data) & 0xFF
+
+
+def _calib_read_block(s, addr, length):
+    cmd = bytes([
+        0x52,
+        (addr >> 24) & 0xFF, (addr >> 16) & 0xFF,
+        (addr >> 8) & 0xFF, addr & 0xFF,
+        length & 0xFF,
+    ])
+    _calib_send(s, cmd)
+
+    resp = _calib_recv(s, 8 + length)
+    if resp[0] != 0x57:
+        raise RuntimeError(f"Expected 'W' (0x57), got 0x{resp[0]:02X}")
+    resp_addr = int.from_bytes(resp[1:5], 'big')
+    resp_len = resp[5]
+    if resp_addr != addr or resp_len != length:
+        raise RuntimeError(
+            f'Address/length mismatch: expected {addr:#010x}/{length}, '
+            f'got {resp_addr:#010x}/{resp_len}')
+    if resp[-1] != 0x06:
+        raise RuntimeError('Missing ACK after data block')
+    cksum = _calib_checksum(resp[1:-2])
+    if cksum != resp[-2]:
+        raise RuntimeError(
+            f'Checksum mismatch at {addr:#010x}: '
+            f'got 0x{cksum:02X}, expected 0x{resp[-2]:02X}')
+    return resp[6:6 + length]
+
+
+def backup_worker(port, out_dir, prefix):
+    s = None
+    try:
+        try:
+            s = serial.Serial(port=port, baudrate=CALIB_BAUD,
+                              bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
+                              stopbits=serial.STOPBITS_ONE, timeout=0.1)
+        except Exception as e:
+            log(f'Error opening serial port {port}: {e}', 'error')
+            return
+
+        log('Entering programming mode...')
+        _calib_send(s, b'PROGRAM')
+        if _calib_recv(s, 3) != bytes.fromhex('515806'):
+            log('Failed to start programming mode!', 'error')
+            return
+        log('Programming mode acknowledged.', 'ok')
+
+        # Verify we are talking to the expected radio before trusting any data.
+        _calib_send(s, bytes([0x02]))
+        idbuf = _calib_recv(s, 16)
+        device_id = idbuf[:8] + idbuf[9:]
+        if device_id != EXPECTED_DEVICE_ID:
+            log(f'Device ID mismatch, aborting. Got {device_id!r}', 'error')
+            return
+        log('Device ID verified.', 'ok')
+
+        total = sum(size for _, size, _ in READ_REGIONS)
+        done = 0
+        start = time.time()
+        last_ui = 0.0
+        regions = {}
+        for base, size, name in READ_REGIONS:
+            log(f'Reading {name} region 0x{base:08X} ({size} bytes)...')
+            buf = bytearray()
+            addr = base
+            off = 0
+            while off < size:
+                if not state['backuping']:
+                    raise _Cancelled()
+                n = min(READ_CHUNK, size - off)
+                buf += _calib_read_block(s, addr, n)
+                off += n
+                addr += n
+                done += n
+
+                now = time.time()
+                if now - last_ui >= 0.1 or done == total:
+                    last_ui = now
+                    frac = done / total
+                    dpg.set_value('calib_progress', frac)
+                    dpg.configure_item('calib_progress',
+                                       overlay=f'{frac * 100:0.1f}%')
+                    dpg.set_value('calib_status', f'{name}: {off}/{size} bytes')
+            regions[name] = bytes(buf)
+
+        _calib_send(s, b'END')
+        if _calib_recv(s, 1) != b'\x06':
+            log('Unexpected response ending session.', 'warn')
+        s.close()
+        s = None
+
+        # Write one file per region.
+        safe_prefix = prefix.strip() or 'calibration'
+        written = 0
+        for _, _, name in READ_REGIONS:
+            path = os.path.join(out_dir, f'{safe_prefix}-{name}.bin')
+            with open(path, 'wb') as f:
+                f.write(regions[name])
+            log(f'Wrote {path}', 'ok')
+            written += 1
+
+        dpg.configure_item('calib_progress', overlay='Complete')
+        dpg.set_value('calib_status', f'Backup complete, {written} file(s) written.')
+        log('Calibration backup complete.', 'ok')
+
+    except _Cancelled:
+        log('Backup cancelled by user.', 'warn')
+    except Exception as e:
+        log(f'Backup failed: {e}', 'error')
+    finally:
+        try:
+            if s is not None:
+                s.close()
+        except Exception:
+            pass
+        state['backuping'] = False
+        state['busy'] = False
+        dpg.configure_item('calib_button', label='Backup calibration')
+        dpg.configure_item('calib_cancel_button', enabled=False)
+        update_controls()
 
 
 # ----------------------------------------------------------------------------
@@ -265,7 +453,7 @@ def flash_worker(port, firmware):
 # ----------------------------------------------------------------------------
 def confirm_flash(sender=None, app_data=None):
     """Validate selection and pop the confirmation modal."""
-    if state['flashing']:
+    if state['busy']:
         return
     port = dpg.get_value('port_combo')
     if not port:
@@ -301,19 +489,17 @@ def confirm_no(sender=None, app_data=None):
 
 
 def start_flash():
-    if state['flashing']:
+    if state['busy']:
         return
     port = dpg.get_value('port_combo')
 
+    state['busy'] = True
     state['flashing'] = True
     dpg.set_value('progress_bar', 0.0)
     dpg.configure_item('progress_bar', overlay='0.0%')
-    dpg.configure_item('flash_button', enabled=False, label='Flashing...')
+    dpg.configure_item('flash_button', label='Flashing...')
     dpg.configure_item('cancel_button', enabled=True)
-    # Lock the controls that must not change mid-flash.
-    dpg.configure_item('refresh_button', enabled=False)
-    dpg.configure_item('browse_button', enabled=False)
-    dpg.configure_item('port_combo', enabled=False)
+    update_controls()
     log(f'Starting flash on {port} at {BAUDRATE} baud...', 'info')
 
     worker = threading.Thread(
@@ -329,6 +515,51 @@ def cancel_flash(sender=None, app_data=None):
 
 
 # ----------------------------------------------------------------------------
+# Backup start / cancel
+# ----------------------------------------------------------------------------
+def on_calib_dir(sender, app_data):
+    path = app_data.get('file_path_name') or app_data.get('current_path')
+    if path and os.path.isdir(path):
+        state['calib_dir'] = path
+        dpg.set_value('calib_dir_label', path)
+
+
+def start_backup(sender=None, app_data=None):
+    if state['busy']:
+        return
+    port = dpg.get_value('port_combo')
+    if not port:
+        log('No serial port selected.', 'warn')
+        return
+    out_dir = state['calib_dir']
+    if not out_dir or not os.path.isdir(out_dir):
+        log('Choose a valid output folder first.', 'warn')
+        return
+    prefix = dpg.get_value('calib_prefix')
+
+    state['busy'] = True
+    state['backuping'] = True
+    dpg.set_value('calib_progress', 0.0)
+    dpg.configure_item('calib_progress', overlay='0.0%')
+    dpg.set_value('calib_status', 'Starting...')
+    dpg.configure_item('calib_button', label='Backing up...')
+    dpg.configure_item('calib_cancel_button', enabled=True)
+    update_controls()
+    log(f'Starting calibration backup on {port} at {CALIB_BAUD} baud...', 'info')
+
+    worker = threading.Thread(
+        target=backup_worker, args=(port, out_dir, prefix), daemon=True)
+    state['worker'] = worker
+    worker.start()
+
+
+def cancel_backup(sender=None, app_data=None):
+    if state['backuping']:
+        state['backuping'] = False
+        log('Cancelling...', 'warn')
+
+
+# ----------------------------------------------------------------------------
 # UI construction
 # ----------------------------------------------------------------------------
 def build_ui():
@@ -339,6 +570,11 @@ def build_ui():
         tag='firmware_dialog', width=600, height=400):
         dpg.add_file_extension('.*')
         dpg.add_file_extension('Firmware (*.bin){.bin}', color=(120, 220, 120))
+
+    with dpg.file_dialog(
+        directory_selector=True, show=False, callback=on_calib_dir,
+        tag='calib_dir_dialog', width=600, height=400):
+        pass
 
     # Confirmation modal (hidden until a flash is requested).
     with dpg.window(label='Confirm flash', modal=True, show=False,
@@ -353,57 +589,133 @@ def build_ui():
                            callback=confirm_no)
 
     with dpg.window(tag='primary'):
-        dpg.add_text('Anytone D168UV raw firmware flasher',
+        # Title block
+        dpg.add_text('Anytone D168UV firmware toolkit',
                      color=(140, 190, 255))
-        dpg.add_text('Copyright 2025 Dual Tachyon - UI by Joel Calado',
+        dpg.add_text('Copyright 2025 Dual Tachyon  -  UI by Joel Calado',
                      color=(150, 150, 150))
+        dpg.add_spacer(height=2)
         dpg.add_separator()
+        dpg.add_spacer(height=6)
 
-        # Serial port row
-        with dpg.group(horizontal=True):
-            dpg.add_text('Serial port:')
-            dpg.add_combo([], tag='port_combo', width=260,
-                          callback=update_port_desc)
-            dpg.add_button(label='Refresh', tag='refresh_button',
-                           callback=refresh_ports)
-        dpg.add_text('', tag='port_desc_label', color=(150, 150, 150),
-                     indent=90)
+        # Shared device selection
+        with dpg.table(header_row=False, borders_innerH=False,
+                       borders_outerH=False, borders_innerV=False,
+                       borders_outerV=False,
+                       policy=dpg.mvTable_SizingStretchProp):
+            dpg.add_table_column(width_fixed=True, init_width_or_weight=82)
+            dpg.add_table_column()
 
-        # Firmware row
-        with dpg.group(horizontal=True):
-            dpg.add_text('Firmware:')
-            dpg.add_button(label='Browse...', tag='browse_button',
-                           callback=lambda: dpg.show_item('firmware_dialog'))
-            dpg.add_text('(none selected)', tag='firmware_label',
-                         color=(200, 200, 120))
+            with dpg.table_row():
+                dpg.add_text('Serial port')
+                with dpg.group(horizontal=True):
+                    dpg.add_combo([], tag='port_combo', width=-104,
+                                  callback=update_port_desc)
+                    dpg.add_button(label='Refresh', tag='refresh_button',
+                                   width=94, callback=refresh_ports)
 
+            with dpg.table_row():
+                dpg.add_text('')
+                dpg.add_text('', tag='port_desc_label', color=(150, 150, 150))
+
+        dpg.add_spacer(height=6)
+
+        # Operation tabs
+        with dpg.tab_bar():
+            # -- Flash firmware --------------------------------------------
+            with dpg.tab(label='Flash firmware'):
+                dpg.add_spacer(height=4)
+                with dpg.table(header_row=False, borders_innerH=False,
+                               borders_outerH=False, borders_innerV=False,
+                               borders_outerV=False,
+                               policy=dpg.mvTable_SizingStretchProp):
+                    dpg.add_table_column(width_fixed=True, init_width_or_weight=82)
+                    dpg.add_table_column()
+                    with dpg.table_row():
+                        dpg.add_text('Firmware')
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(
+                                label='Browse...', tag='browse_button', width=94,
+                                callback=lambda: dpg.show_item('firmware_dialog'))
+                            dpg.add_text('(none selected)', tag='firmware_label',
+                                         color=(200, 200, 120))
+
+                dpg.add_spacer(height=6)
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label='Flash Firmware', tag='flash_button',
+                                   callback=confirm_flash, enabled=False,
+                                   width=150, height=34)
+                    dpg.add_button(label='Cancel', tag='cancel_button',
+                                   callback=cancel_flash, enabled=False,
+                                   width=90, height=34)
+
+                dpg.add_spacer(height=4)
+                dpg.add_progress_bar(tag='progress_bar', default_value=0.0,
+                                     width=-1, overlay='')
+                dpg.add_text('', tag='addr_label', color=(150, 150, 150))
+
+            # -- Backup calibration ----------------------------------------
+            with dpg.tab(label='Backup calibration'):
+                dpg.add_spacer(height=4)
+                dpg.add_text('Reads the calibration and device-info regions to '
+                             '.bin files.', color=(180, 180, 180))
+                dpg.add_text('Recommended before flashing custom firmware.',
+                             color=(150, 150, 150))
+                dpg.add_spacer(height=4)
+
+                with dpg.table(header_row=False, borders_innerH=False,
+                               borders_outerH=False, borders_innerV=False,
+                               borders_outerV=False,
+                               policy=dpg.mvTable_SizingStretchProp):
+                    dpg.add_table_column(width_fixed=True, init_width_or_weight=82)
+                    dpg.add_table_column()
+
+                    with dpg.table_row():
+                        dpg.add_text('Save to')
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(
+                                label='Folder...', tag='calib_folder_button',
+                                width=94,
+                                callback=lambda: dpg.show_item('calib_dir_dialog'))
+                            dpg.add_text(state['calib_dir'], tag='calib_dir_label',
+                                         color=(150, 150, 150))
+
+                    with dpg.table_row():
+                        dpg.add_text('Prefix')
+                        dpg.add_input_text(tag='calib_prefix',
+                                           default_value='at168-calib', width=-1)
+
+                dpg.add_spacer(height=6)
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label='Backup calibration', tag='calib_button',
+                                   callback=start_backup, enabled=False,
+                                   width=170, height=34)
+                    dpg.add_button(label='Cancel', tag='calib_cancel_button',
+                                   callback=cancel_backup, enabled=False,
+                                   width=90, height=34)
+
+                dpg.add_spacer(height=4)
+                dpg.add_progress_bar(tag='calib_progress', default_value=0.0,
+                                     width=-1, overlay='')
+                dpg.add_text('', tag='calib_status', color=(150, 150, 150))
+
+        dpg.add_spacer(height=6)
         dpg.add_separator()
+        dpg.add_spacer(height=4)
 
-        # Action buttons
-        with dpg.group(horizontal=True):
-            dpg.add_button(label='Flash Firmware', tag='flash_button',
-                           callback=confirm_flash, enabled=False, width=150,
-                           height=32)
-            dpg.add_button(label='Cancel', tag='cancel_button',
-                           callback=cancel_flash, enabled=False, height=32)
-
-        dpg.add_progress_bar(tag='progress_bar', default_value=0.0,
-                             width=-1, overlay='')
-        dpg.add_text('', tag='addr_label', color=(150, 150, 150))
-
-        dpg.add_separator()
-        dpg.add_text('Log:')
+        # Shared log
+        dpg.add_text('Log')
         with dpg.child_window(tag='log_window', height=-1, width=-1,
                               border=True):
             pass
 
-    dpg.create_viewport(title='AT168 Flasher', width=640, height=580,
-                        min_width=520, min_height=460)
+    dpg.create_viewport(title='AT168 Flasher', width=600, height=640,
+                        min_width=520, min_height=520)
     dpg.setup_dearpygui()
     dpg.set_primary_window('primary', True)
     dpg.show_viewport()
 
-    log('Ready. Select a serial port and firmware, then click Flash.')
+    log('Ready. Select a serial port, then flash firmware or back up calibration.')
     refresh_ports(quiet=True)
 
     dpg.start_dearpygui()
