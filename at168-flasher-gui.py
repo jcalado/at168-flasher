@@ -52,6 +52,14 @@ READ_REGIONS = [
     (0x02FA0000,  512, 'device-info'),
 ]
 
+# ----------------------------------------------------------------------------
+# License install protocol (PROGRAM / WRITE)
+# ----------------------------------------------------------------------------
+LICENSE_BAUD = 4000000
+LICENSE_SIZE = 96               # license blobs are exactly 96 bytes
+LICENSE_ADDRESS = 0x2EC0000
+LICENSE_CHUNK = 16
+
 
 class _Cancelled(Exception):
     """Raised inside the backup worker when the user cancels."""
@@ -63,9 +71,12 @@ class _Cancelled(Exception):
 state = {
     'firmware_path': None,
     'firmware': None,
+    'license_path': None,
+    'license': None,
     'busy': False,        # any long operation is running (locks shared controls)
-    'flashing': False,    # flash loop active   (also the cancel flag)
-    'backuping': False,   # backup loop active  (also the cancel flag)
+    'flashing': False,    # flash loop active    (also the cancel flag)
+    'backuping': False,   # backup loop active   (also the cancel flag)
+    'licensing': False,   # license loop active  (also the cancel flag)
     'calib_dir': os.getcwd(),
     'worker': None,
 }
@@ -157,6 +168,28 @@ def update_controls():
     dpg.configure_item('calib_folder_button', enabled=not busy)
     dpg.configure_item('calib_button', enabled=(not busy and port_ok))
 
+    # License tab
+    dpg.configure_item('license_browse_button', enabled=not busy)
+    dpg.configure_item('license_button', enabled=(
+        not busy and state['license'] is not None and port_ok))
+
+
+def show_file_dialog(tag):
+    """Open one of the internal file dialogs, sized to fit the current window.
+
+    DearPyGui file dialogs are drawn *inside* the viewport rather than as a
+    native OS dialog, so a fixed size can overflow the app window - notably on
+    high-DPI displays (e.g. 200-250% scaling), where the dialog's own controls
+    (the OK/Cancel buttons, path bar) end up clipped and unreachable. Fit the
+    dialog to the live viewport client area every time it opens so it works at
+    any scale and after the user resizes the window.
+    """
+    vw = dpg.get_viewport_client_width()
+    vh = dpg.get_viewport_client_height()
+    dpg.configure_item(tag, width=max(320, int(vw * 0.92)),
+                       height=max(240, int(vh * 0.85)))
+    dpg.show_item(tag)
+
 
 # ----------------------------------------------------------------------------
 # Firmware selection
@@ -213,6 +246,41 @@ def on_firmware_selected(sender, app_data):
     dpg.set_value('firmware_label', f'{os.path.basename(path)}  ({len(data)} bytes)')
     if not warnings:
         log(f'Loaded firmware "{os.path.basename(path)}" ({len(data)} bytes).', 'ok')
+    update_controls()
+
+
+# ----------------------------------------------------------------------------
+# License selection
+# ----------------------------------------------------------------------------
+def on_license_selected(sender, app_data):
+    # See on_firmware_selected for why we fall back to the 'selections' map.
+    path = app_data.get('file_path_name')
+    if not path or not os.path.isfile(path):
+        selections = app_data.get('selections') or {}
+        path = next(iter(selections.values()), None)
+    if not path or not os.path.isfile(path):
+        log('Could not determine the selected license file.', 'warn')
+        return
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+    except Exception as e:
+        log(f'Error loading license: {e}', 'error')
+        return
+
+    if len(data) != LICENSE_SIZE:
+        log(f'Invalid license file: {len(data)} bytes '
+            f'(expected {LICENSE_SIZE}).', 'error')
+        state['license_path'] = None
+        state['license'] = None
+        dpg.set_value('license_label', '(invalid file)')
+        update_controls()
+        return
+
+    state['license_path'] = path
+    state['license'] = data
+    dpg.set_value('license_label', f'{os.path.basename(path)}  ({len(data)} bytes)')
+    log(f'Loaded license "{os.path.basename(path)}" ({len(data)} bytes).', 'ok')
     update_controls()
 
 
@@ -449,6 +517,74 @@ def backup_worker(port, out_dir, prefix):
 
 
 # ----------------------------------------------------------------------------
+# License install worker  (ported from at168-lic.py)
+# ----------------------------------------------------------------------------
+def license_worker(port, licbin):
+    s = None
+    try:
+        try:
+            s = serial.Serial(port=port, baudrate=LICENSE_BAUD, timeout=1)
+        except Exception as e:
+            log(f'Error opening serial port {port}: {e}', 'error')
+            return
+
+        log('Entering programming mode...')
+        s.write(b'PROGRAM')
+        if s.read(3) != b'QX\x06':
+            log('Failed to start programming mode!', 'error')
+            return
+        log('Programming mode acknowledged.', 'ok')
+
+        log('Writing license...')
+        total = len(licbin)
+        address = LICENSE_ADDRESS
+        offset = 0
+        start = time.time()
+        while offset < total:
+            if not state['licensing']:
+                log('License install cancelled by user.', 'warn')
+                return
+
+            chunk = min(total - offset, LICENSE_CHUNK)
+            packet = b'W' + pack('>IB', address, chunk) + licbin[offset:offset + chunk]
+            packet += bytes([sum(packet[1:]) & 0xFF])
+            packet += b'\x06'
+            s.write(packet)
+            if s.read() != b'\x06':
+                log(f'Failed to write license at 0x{address:08X}!', 'error')
+                return
+
+            offset += chunk
+            address += chunk
+
+            frac = offset / total
+            dpg.set_value('license_progress', frac)
+            dpg.configure_item('license_progress',
+                               overlay=f'{frac * 100:0.1f}%  ({offset}/{total})')
+
+        s.write(b'END')
+
+        elapsed = time.time() - start
+        dpg.configure_item('license_progress', overlay='Complete')
+        log(f'License install complete! Wrote {total} bytes in '
+            f'{fmt_eta(elapsed)}.', 'ok')
+
+    except Exception as e:
+        log(f'License install failed: {e}', 'error')
+    finally:
+        try:
+            if s is not None:
+                s.close()
+        except Exception:
+            pass
+        state['licensing'] = False
+        state['busy'] = False
+        dpg.configure_item('license_button', label='Install License')
+        dpg.configure_item('license_cancel_button', enabled=False)
+        update_controls()
+
+
+# ----------------------------------------------------------------------------
 # Confirmation + flash start
 # ----------------------------------------------------------------------------
 def confirm_flash(sender=None, app_data=None):
@@ -560,6 +696,41 @@ def cancel_backup(sender=None, app_data=None):
 
 
 # ----------------------------------------------------------------------------
+# License install start / cancel
+# ----------------------------------------------------------------------------
+def start_license(sender=None, app_data=None):
+    if state['busy']:
+        return
+    port = dpg.get_value('port_combo')
+    if not port:
+        log('No serial port selected.', 'warn')
+        return
+    if state['license'] is None:
+        log('No license file loaded.', 'warn')
+        return
+
+    state['busy'] = True
+    state['licensing'] = True
+    dpg.set_value('license_progress', 0.0)
+    dpg.configure_item('license_progress', overlay='0.0%')
+    dpg.configure_item('license_button', label='Installing...')
+    dpg.configure_item('license_cancel_button', enabled=True)
+    update_controls()
+    log(f'Starting license install on {port} at {LICENSE_BAUD} baud...', 'info')
+
+    worker = threading.Thread(
+        target=license_worker, args=(port, state['license']), daemon=True)
+    state['worker'] = worker
+    worker.start()
+
+
+def cancel_license(sender=None, app_data=None):
+    if state['licensing']:
+        state['licensing'] = False
+        log('Cancelling...', 'warn')
+
+
+# ----------------------------------------------------------------------------
 # UI construction
 # ----------------------------------------------------------------------------
 def build_ui():
@@ -575,6 +746,12 @@ def build_ui():
         directory_selector=True, show=False, callback=on_calib_dir,
         tag='calib_dir_dialog', width=600, height=400):
         pass
+
+    with dpg.file_dialog(
+        directory_selector=False, show=False, callback=on_license_selected,
+        tag='license_dialog', width=600, height=400):
+        dpg.add_file_extension('.*')
+        dpg.add_file_extension('License (*.bin){.bin}', color=(120, 220, 120))
 
     # Confirmation modal (hidden until a flash is requested).
     with dpg.window(label='Confirm flash', modal=True, show=False,
@@ -636,7 +813,7 @@ def build_ui():
                         with dpg.group(horizontal=True):
                             dpg.add_button(
                                 label='Browse...', tag='browse_button', width=94,
-                                callback=lambda: dpg.show_item('firmware_dialog'))
+                                callback=lambda: show_file_dialog('firmware_dialog'))
                             dpg.add_text('(none selected)', tag='firmware_label',
                                          color=(200, 200, 120))
 
@@ -676,7 +853,7 @@ def build_ui():
                             dpg.add_button(
                                 label='Folder...', tag='calib_folder_button',
                                 width=94,
-                                callback=lambda: dpg.show_item('calib_dir_dialog'))
+                                callback=lambda: show_file_dialog('calib_dir_dialog'))
                             dpg.add_text(state['calib_dir'], tag='calib_dir_label',
                                          color=(150, 150, 150))
 
@@ -698,6 +875,42 @@ def build_ui():
                 dpg.add_progress_bar(tag='calib_progress', default_value=0.0,
                                      width=-1, overlay='')
                 dpg.add_text('', tag='calib_status', color=(150, 150, 150))
+
+            # -- Install license -------------------------------------------
+            with dpg.tab(label='Install license'):
+                dpg.add_spacer(height=4)
+                dpg.add_text('Writes a license blob to the radio.',
+                             color=(180, 180, 180))
+                dpg.add_spacer(height=4)
+
+                with dpg.table(header_row=False, borders_innerH=False,
+                               borders_outerH=False, borders_innerV=False,
+                               borders_outerV=False,
+                               policy=dpg.mvTable_SizingStretchProp):
+                    dpg.add_table_column(width_fixed=True, init_width_or_weight=82)
+                    dpg.add_table_column()
+                    with dpg.table_row():
+                        dpg.add_text('License')
+                        with dpg.group(horizontal=True):
+                            dpg.add_button(
+                                label='Browse...', tag='license_browse_button',
+                                width=94,
+                                callback=lambda: show_file_dialog('license_dialog'))
+                            dpg.add_text('(none selected)', tag='license_label',
+                                         color=(200, 200, 120))
+
+                dpg.add_spacer(height=6)
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label='Install License', tag='license_button',
+                                   callback=start_license, enabled=False,
+                                   width=150, height=34)
+                    dpg.add_button(label='Cancel', tag='license_cancel_button',
+                                   callback=cancel_license, enabled=False,
+                                   width=90, height=34)
+
+                dpg.add_spacer(height=4)
+                dpg.add_progress_bar(tag='license_progress', default_value=0.0,
+                                     width=-1, overlay='')
 
         dpg.add_spacer(height=6)
         dpg.add_separator()
