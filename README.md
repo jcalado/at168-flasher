@@ -6,6 +6,17 @@
 
 This lets you flash raw (custom) firmware to the AnyTone D168UV. It might work with other AnyTone models, but not tested. Base address is assumed to be 0x08004000. It was tested on Windows only.
 
+# Web flasher
+
+`web/` contains a browser version (flash firmware, backup calibration,
+install license) built on the Web Serial API. It needs Chrome or Edge and must
+be served over https or from localhost:
+
+    cd web
+    python -m http.server 8000
+
+Then open http://localhost:8000 and click **Select port...**.
+
 # Running from source
 
 Requires Python 3.9+.

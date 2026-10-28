@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AT168 Flasher</title>
+<style>
+  /* Dear PyGui default dark theme, matching the desktop GUI. */
+  :root {
+    --window: rgb(37, 37, 38);
+    --frame: rgb(51, 51, 55);
+    --border: rgb(78, 78, 78);
+    --hover: rgb(34, 83, 118);        /* (29,151,236,103) over the window */
+    --pressed: rgb(15, 86, 135);
+    --tab-active: rgb(15, 86, 135);
+    --histogram: rgb(230, 179, 0);
+    --text: #fff;
+    --text-disabled: rgb(128, 128, 128);
+    --title: rgb(140, 190, 255);
+    --muted: rgb(150, 150, 150);
+    --hint: rgb(180, 180, 180);
+    --file: rgb(200, 200, 120);
+    --ok: rgb(120, 220, 120);
+    --warn: rgb(230, 200, 90);
+    --error: rgb(240, 110, 110);
+    --font: 'ProggyClean', 'Cascadia Mono', Consolas, 'DejaVu Sans Mono', Menlo, monospace;
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body { margin: 0; height: 100%; }
+
+  body {
+    background: var(--window);
+    color: var(--text);
+    font: 13px/1.35 var(--font);
+  }
+
+  ::-webkit-scrollbar { width: 14px; height: 14px; background: rgb(51, 51, 55); }
+  ::-webkit-scrollbar-thumb { background: rgb(82, 82, 85); border: 3px solid rgb(51, 51, 55); border-radius: 7px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgb(90, 90, 95); }
+
+  .app {
+    display: flex;
+    flex-direction: column;
+    max-width: 760px;
+    height: 100%;
+    margin: 0 auto;
+    padding: 8px;
+  }
+
+  .unsupported {
+    margin: 0 0 8px;
+    padding: 6px 8px;
+    border: 1px solid var(--error);
+    color: var(--error);
+  }
+
+  h1 { margin: 6px 0 0; color: var(--title); font: inherit; }
+  .subtitle { margin: 6px 0 0; color: var(--muted); }
+
+  .separator { height: 1px; margin: 10px 0 12px; background: var(--border); flex-shrink: 0; }
+
+  /* Two-column rows with a fixed label column, like the desktop's tables. */
+  .grid {
+    display: grid;
+    grid-template-columns: 92px minmax(0, 1fr);
+    white-space: nowrap;
+    column-gap: 8px;
+    row-gap: 4px;
+    align-items: center;
+  }
+  .group { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .muted { color: var(--muted); }
+  .hint { margin: 0 0 4px; color: var(--hint); }
+  .file-label { color: var(--file); }
+
+  /* Frames: buttons, combo, inputs, progress */
+  .btn, .combo, .input {
+    height: 19px;
+    padding: 0 8px;
+    background: var(--frame);
+    color: var(--text);
+    border: 0;
+    border-radius: 0;
+    font: inherit;
+  }
+  .btn { min-width: 94px; cursor: pointer; white-space: nowrap; user-select: none; }
+  .btn:hover:not(:disabled) { background: var(--hover); }
+  .btn:active:not(:disabled) { background: var(--pressed); }
+  .btn:disabled { color: var(--text-disabled); cursor: default; }
+  label.btn { display: inline-block; line-height: 19px; text-align: center; }
+  .btn.big { height: 34px; }
+  .btn:focus-visible, .combo:focus-visible, .tab:focus-visible, .file-input:focus-visible + .btn {
+    outline: 1px solid var(--title);
+    outline-offset: 1px;
+  }
+
+  .combo {
+    flex: 1;
+    min-width: 0;
+    padding-right: 26px;
+    appearance: none;
+    -webkit-appearance: none;
+    cursor: pointer;
+    /* ImGui-style arrow square on the right. */
+    background:
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='9' height='8'%3E%3Cpath d='M0 0h9L4.5 8z' fill='white'/%3E%3C/svg%3E") no-repeat right 6px center,
+      var(--frame);
+  }
+  .combo:hover:not(:disabled) { background-color: var(--hover); }
+  .combo:disabled { color: var(--text-disabled); cursor: default; }
+  .combo option { background: var(--window); color: var(--text); }
+
+  .input { flex: 1; min-width: 0; padding: 0 4px; }
+  .input:focus { outline: none; background: rgb(25, 70, 104); }
+  .input:disabled { color: var(--text-disabled); }
+
+  /* Native file input sits behind a "Browse..." label button. */
+  .file-input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+  .file-input:disabled + .btn { color: var(--text-disabled); cursor: default; background: var(--frame); }
+
+  progress {
+    display: block;
+    width: 100%;
+    height: 19px;
+    appearance: none;
+    -webkit-appearance: none;
+    border: 0;
+    background: var(--frame);
+  }
+  progress::-webkit-progress-bar { background: var(--frame); }
+  progress::-webkit-progress-value { background: var(--histogram); }
+  progress::-moz-progress-bar { background: var(--histogram); }
+
+  .status { min-height: 18px; margin-top: 4px; color: var(--muted); }
+
+  /* Tabs */
+  .tabbar {
+    display: flex;
+    gap: 4px;
+    margin-top: 10px;
+    padding: 0 4px;
+    border-bottom: 2px solid var(--tab-active);
+    overflow-x: auto;
+    flex-shrink: 0;
+  }
+  .tab {
+    height: 19px;
+    padding: 0 4px;
+    background: var(--frame);
+    color: var(--text);
+    border: 0;
+    border-radius: 3px 3px 0 0;
+    font: inherit;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .tab:hover { background: var(--hover); }
+  .tab[aria-selected="true"] { background: var(--tab-active); }
+
+  .pane { padding-top: 8px; flex-shrink: 0; }
+  .pane .grid { margin: 4px 0 10px; }
+  .actions { display: flex; gap: 8px; margin-bottom: 12px; }
+  .w-150 { width: 150px; }
+  .w-170 { width: 170px; }
+  .w-90 { min-width: 90px; width: 90px; }
+
+  /* Log */
+  .log-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+  .log-header .btn { min-width: 0; }
+  .log {
+    flex: 1;
+    min-height: 120px;
+    overflow: auto;
+    padding: 8px;
+    border: 1px solid var(--border);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .log .ok { color: var(--ok); }
+  .log .warn { color: var(--warn); }
+  .log .error { color: var(--error); }
+
+  /* Modal, styled as an ImGui popup window. */
+  dialog {
+    width: min(460px, calc(100% - 16px));
+    padding: 0;
+    background: var(--window);
+    color: var(--text);
+    border: 1px solid var(--border);
+    font: inherit;
+  }
+  dialog::backdrop { background: rgba(204, 204, 204, .35); }
+  .dialog-title { padding: 3px 8px; background: var(--tab-active); }
+  .dialog-body { padding: 8px; }
+  .dialog-body pre { margin: 0; font: inherit; white-space: pre-wrap; }
+  .dialog-body .separator { margin: 8px 0; }
+  .dialog-body .btn { width: 140px; height: 30px; }
+</style>
+</head>
+<body>
+
+<main class="app">
+  <p id="unsupported" class="unsupported" hidden>
+    This browser does not support the Web Serial API. Use Chrome or Edge over https or localhost.
+  </p>
+
+  <h1>Anytone D168UV firmware toolkit</h1>
+  <p class="subtitle">Copyright 2025 Dual Tachyon &nbsp;-&nbsp; Web UI by Joel Calado</p>
+  <div class="separator"></div>
+
+  <div class="grid">
+    <label for="port-select">Serial port</label>
+    <div class="group">
+      <select id="port-select" class="combo"></select>
+      <button id="port-button" class="btn">Add port...</button>
+    </div>
+    <span></span>
+    <span id="port-desc" class="muted ellipsis"></span>
+  </div>
+
+  <nav class="tabbar" role="tablist">
+    <button class="tab" role="tab" id="tab-btn-fw" aria-controls="tab-fw" aria-selected="true">Flash firmware</button>
+    <button class="tab" role="tab" id="tab-btn-calib" aria-controls="tab-calib" aria-selected="false" tabindex="-1">Backup calibration</button>
+    <button class="tab" role="tab" id="tab-btn-lic" aria-controls="tab-lic" aria-selected="false" tabindex="-1">Install license</button>
+  </nav>
+
+  <section id="tab-fw" class="pane" role="tabpanel" aria-labelledby="tab-btn-fw">
+    <div class="grid">
+      <span>Firmware</span>
+      <div class="group">
+        <input type="file" id="fw-file" class="file-input" accept=".cdd">
+        <label for="fw-file" class="btn">Browse...</label>
+        <span id="fw-label" class="file-label ellipsis">(none selected)</span>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="fw-button" class="btn big w-150" disabled>Flash Firmware</button>
+      <button id="fw-cancel" class="btn big w-90" disabled>Cancel</button>
+    </div>
+    <progress id="fw-progress" value="0" max="1"></progress>
+    <div id="fw-status" class="status"></div>
+  </section>
+
+  <section id="tab-calib" class="pane" role="tabpanel" aria-labelledby="tab-btn-calib" hidden>
+    <p class="hint">Reads the calibration and device-info regions to .bin files.</p>
+    <p class="hint muted">Recommended before flashing custom firmware.</p>
+    <div class="grid">
+      <span>Save to</span>
+      <span class="muted ellipsis">Browser downloads folder</span>
+      <label for="calib-prefix">Prefix</label>
+      <div class="group">
+        <input type="text" id="calib-prefix" class="input" value="at168-calib" spellcheck="false">
+      </div>
+    </div>
+    <div class="actions">
+      <button id="calib-button" class="btn big w-170" disabled>Backup calibration</button>
+      <button id="calib-cancel" class="btn big w-90" disabled>Cancel</button>
+    </div>
+    <progress id="calib-progress" value="0" max="1"></progress>
+    <div id="calib-status" class="status"></div>
+  </section>
+
+  <section id="tab-lic" class="pane" role="tabpanel" aria-labelledby="tab-btn-lic" hidden>
+    <p class="hint">Writes a license blob to the radio.</p>
+    <div class="grid">
+      <span>License</span>
+      <div class="group">
+        <input type="file" id="lic-file" class="file-input" accept=".bin,application/octet-stream">
+        <label for="lic-file" class="btn">Browse...</label>
+        <span id="lic-label" class="file-label ellipsis">(none selected)</span>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="lic-button" class="btn big w-150" disabled>Install License</button>
+      <button id="lic-cancel" class="btn big w-90" disabled>Cancel</button>
+    </div>
+    <progress id="lic-progress" value="0" max="1"></progress>
+    <div id="lic-status" class="status"></div>
+  </section>
+
+  <div class="separator"></div>
+
+  <div class="log-header">
+    <span>Log</span>
+    <button id="log-clear" class="btn">Clear</button>
+  </div>
+  <div id="log" class="log" role="log" aria-live="polite"></div>
+</main>
+
+<dialog id="confirm-dialog">
+  <div class="dialog-title">Confirm flash</div>
+  <form method="dialog" class="dialog-body">
+    <pre id="confirm-text"></pre>
+    <div class="separator"></div>
+    <div class="group">
+      <button value="ok" class="btn">Flash</button>
+      <button value="cancel" class="btn" autofocus>Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="flasher.js"></script>
+</body>
+</html>
