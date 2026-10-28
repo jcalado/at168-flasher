@@ -109,7 +109,7 @@ class Link {
   }
 
   async open(baudRate) {
-    await this.port.open({ baudRate, dataBits: 8, parity: 'none', stopBits: 1, bufferSize: 65536 });
+    await this.port.open({ baudRate, dataBits: 8, parity: 'none', stopBits: 1, bufferSize: 16 * 1024 * 1024 });
     this.writer = this.port.writable.getWriter();
     this.reader = this.port.readable.getReader();
     this.loop = this.readLoop();
