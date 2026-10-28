@@ -433,7 +433,9 @@ async function flash() {
         await link.send(packet);
         const ack = await link.tryRecv(1, FLASH_TIMEOUT);
         if (!ack || ack[0] !== ACK) {
-          log(`Failed to update at ${hex8(address)}!`, 'error');
+          const got = ack ? `got ${hex2(ack[0])}` : 'no response';
+          log(`Failed to update at ${hex8(address)} (offset ${hex8(offset)}): ${got}.`, 'error');
+          log(`Packet: ${[...packet].map((b) => b.toString(16).padStart(2, '0')).join(' ')}`, 'error');
           return;
         }
 
