@@ -10,7 +10,9 @@ This lets you flash raw (custom) firmware to the AnyTone D168UV. It might work w
 
 `docs/` contains a browser version (flash firmware, backup calibration,
 install license) built on the Web Serial API. It needs Chrome or Edge and must
-be served over https or from localhost:
+be served over https or from localhost. On Android, Chrome lists no wired
+serial ports on most phones, so the page talks to the radio's built-in USB
+(CDC-ACM, `2e3c:5740`) over WebUSB instead; connect it with a USB-C OTG cable.
 
     cd docs
     python -m http.server 8000

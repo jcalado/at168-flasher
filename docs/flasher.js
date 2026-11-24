@@ -192,6 +192,134 @@ class Link {
 const equalBytes = (a, b) => a && a.length === b.length && a.every((v, i) => v === b[i]);
 
 // ----------------------------------------------------------------------------
+// WebUSB CDC-ACM port: the subset of the Web Serial SerialPort interface that
+// Link uses, implemented over WebUSB.
+//
+// Chrome on Android exposes Web Serial, but most phones list no wired serial
+// ports, while WebUSB works there. The radio's MCU (Artery, 2e3c:5740) speaks
+// plain CDC-ACM, so it can be driven directly without any adapter driver.
+// ----------------------------------------------------------------------------
+const CDC_SET_LINE_CODING = 0x20;
+const CDC_SET_CONTROL_LINE_STATE = 0x22;
+const USB_READ_SIZE = 16384;
+
+class UsbSerialPort {
+  constructor(device) {
+    this.device = device;
+    this.readable = null;
+    this.writable = null;
+  }
+
+  getInfo() {
+    return { usbVendorId: this.device.vendorId, usbProductId: this.device.productId };
+  }
+
+  findInterfaces() {
+    let control = null;
+    let data = null;
+    for (const iface of this.device.configuration.interfaces) {
+      const alt = iface.alternates[0];
+      if (alt.interfaceClass === 0x02 && !control) control = iface;
+      if (alt.interfaceClass === 0x0a && !data) data = iface;
+    }
+    if (!data) throw new Error('No CDC data interface on this USB device');
+    const eps = data.alternates[0].endpoints;
+    const inEp = eps.find((e) => e.direction === 'in' && e.type === 'bulk');
+    const outEp = eps.find((e) => e.direction === 'out' && e.type === 'bulk');
+    if (!inEp || !outEp) throw new Error('CDC data interface has no bulk endpoints');
+    return { control, data, inEp, outEp };
+  }
+
+  async open({ baudRate, dataBits = 8, stopBits = 1, parity = 'none' }) {
+    const dev = this.device;
+    await dev.open();
+    if (!dev.configuration) await dev.selectConfiguration(1);
+    const { control, data, inEp, outEp } = this.findInterfaces();
+    // The control interface carries the line-coding requests; when it is
+    // missing, send them to the data interface instead.
+    const ctrlNum = (control || data).interfaceNumber;
+    if (control) await dev.claimInterface(control.interfaceNumber);
+    await dev.claimInterface(data.interfaceNumber);
+
+    const coding = new DataView(new ArrayBuffer(7));
+    coding.setUint32(0, baudRate, true);
+    coding.setUint8(4, stopBits === 2 ? 2 : 0);
+    coding.setUint8(5, { none: 0, odd: 1, even: 2 }[parity] ?? 0);
+    coding.setUint8(6, dataBits);
+    const setup = (request, value) => ({ requestType: 'class', recipient: 'interface', request, value, index: ctrlNum });
+    await dev.controlTransferOut(setup(CDC_SET_LINE_CODING, 0), coding.buffer);
+    await dev.controlTransferOut(setup(CDC_SET_CONTROL_LINE_STATE, 0x03)); // DTR | RTS
+
+    let closed = false;
+    this.stop = () => { closed = true; };
+    this.readable = new ReadableStream({
+      pull: async (ctl) => {
+        for (;;) {
+          let res;
+          try {
+            res = await dev.transferIn(inEp.endpointNumber, USB_READ_SIZE);
+          } catch (e) {
+            if (!closed) ctl.error(e);
+            return;
+          }
+          if (res.status === 'stall') {
+            await dev.clearHalt('in', inEp.endpointNumber);
+            continue;
+          }
+          if (res.data && res.data.byteLength) {
+            ctl.enqueue(new Uint8Array(res.data.buffer, res.data.byteOffset, res.data.byteLength).slice());
+            return;
+          }
+        }
+      },
+      cancel: () => { closed = true; },
+    });
+    this.writable = new WritableStream({
+      write: async (chunk) => {
+        const res = await dev.transferOut(outEp.endpointNumber, chunk);
+        if (res.status !== 'ok') throw new Error(`USB write failed: ${res.status}`);
+      },
+    });
+  }
+
+  async close() {
+    if (this.stop) this.stop();
+    this.readable = null;
+    this.writable = null;
+    try { await this.device.close(); } catch (e) { /* ignore */ }
+  }
+}
+
+// Android lists no wired ports through Web Serial on most phones, so use
+// WebUSB there (and anywhere Web Serial is missing).
+const useUsb = 'usb' in navigator
+  && (!('serial' in navigator) || /Android/i.test(navigator.userAgent));
+
+// Keep one wrapper per USBDevice so port identity survives refreshes.
+const usbPorts = new Map();
+function usbPort(device) {
+  if (!usbPorts.has(device)) usbPorts.set(device, new UsbSerialPort(device));
+  return usbPorts.get(device);
+}
+
+const isCdc = (device) => device.configuration?.interfaces.some(
+  (i) => i.alternates[0].interfaceClass === 0x0a) ?? true;
+
+async function getGrantedPorts() {
+  if (!useUsb) return navigator.serial.getPorts();
+  const devices = await navigator.usb.getDevices();
+  return devices.filter(isCdc).map(usbPort);
+}
+
+async function requestNewPort() {
+  if (!useUsb) return navigator.serial.requestPort();
+  const device = await navigator.usb.requestDevice({
+    filters: [{ vendorId: 0x2e3c }, { classCode: 0x02 }],
+  });
+  return usbPort(device);
+}
+
+// ----------------------------------------------------------------------------
 // Port selection
 // ----------------------------------------------------------------------------
 // Common USB-serial bridge vendors, for the description under the combo.
@@ -201,6 +329,7 @@ const USB_VENDORS = {
   0x10c4: 'Silicon Labs CP210x',
   0x1a86: 'WCH CH34x',
   0x0483: 'STMicroelectronics',
+  0x2e3c: 'Artery (radio built-in USB)',
 };
 
 // Granted ports, in the order shown in the combo.
@@ -230,7 +359,7 @@ function setPort(port) {
 // Rebuilds the combo from the ports this site has been granted, keeping the
 // current selection when it is still present.
 async function refreshPorts() {
-  ports = await navigator.serial.getPorts();
+  ports = await getGrantedPorts();
   const select = $('port-select');
   select.replaceChildren();
   if (!ports.length) {
@@ -247,7 +376,7 @@ async function refreshPorts() {
 
 async function selectPort() {
   try {
-    const port = await navigator.serial.requestPort();
+    const port = await requestNewPort();
     await refreshPorts();
     setPort(port);
     log(`Selected ${describePort(port)}.`);
@@ -679,7 +808,7 @@ async function init() {
   initTabs();
   $('log-clear').addEventListener('click', () => { $('log').textContent = ''; });
 
-  if (!('serial' in navigator)) {
+  if (!('serial' in navigator) && !useUsb) {
     $('unsupported').hidden = false;
     $('port-button').disabled = true;
     $('port-select').disabled = true;
@@ -703,13 +832,17 @@ async function init() {
   }
 
   // Granted ports come and go as cables are plugged in and out.
-  navigator.serial.addEventListener('connect', () => refreshPorts());
-  navigator.serial.addEventListener('disconnect', (e) => {
-    if (e.target === state.port) log('Serial port disconnected.', 'warn');
+  const events = useUsb ? navigator.usb : navigator.serial;
+  events.addEventListener('connect', () => refreshPorts());
+  events.addEventListener('disconnect', (e) => {
+    const gone = useUsb ? usbPorts.get(e.device) : e.target;
+    if (gone && gone === state.port) log('Serial port disconnected.', 'warn');
+    if (useUsb) usbPorts.delete(e.device);
     refreshPorts();
   });
 
   await refreshPorts();
+  if (useUsb) log('Using WebUSB (Android). Connect the radio with a USB-C OTG cable.');
   log('Ready. Select a serial port, then flash firmware or back up calibration.');
   updateControls();
 }
